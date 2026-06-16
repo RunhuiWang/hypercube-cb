@@ -651,24 +651,32 @@ public sealed class ParquetCellSpillBackend<T> : IStateBackend<CellAggregateStat
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_filePath))!);
-        using var stream = ParquetFileIO.CreateExclusive(_filePath);
-        using var writer = ParquetWriter.CreateAsync(_layout.ParquetSchema, stream).GetAwaiter().GetResult();
-        using var groupWriter = writer.CreateRowGroup();
 
-        var keyField = _layout.ParquetSchema.DataFields.First(static field => field.Name == ParquetCellColumns.KeyColumn);
-        var lastAccessField = _layout.ParquetSchema.DataFields.First(static field => field.Name == ParquetCellColumns.LastAccessColumn);
-        groupWriter.WriteColumnAsync(new DataColumn(keyField, keys)).GetAwaiter().GetResult();
-        groupWriter.WriteColumnAsync(new DataColumn(lastAccessField, lastAccess)).GetAwaiter().GetResult();
-
-        for (var slot = 0; slot < _layout.ScalarSlotCount; slot++)
+        // Write the whole file beside the spill file, then replace the spill file in one rename.
+        // Readers do not take _flushGate (LoadExisting and outside readers take no lock), so they must never meet the writer's exclusive handle or a half-written file.
+        var tempPath = ParquetFileIO.TempPathFor(_filePath);
         {
-            groupWriter.WriteColumnAsync(new DataColumn(_layout.ScalarFields[slot], scalarColumns[slot])).GetAwaiter().GetResult();
+            using var stream = ParquetFileIO.CreateExclusive(tempPath);
+            using var writer = ParquetWriter.CreateAsync(_layout.ParquetSchema, stream).GetAwaiter().GetResult();
+            using var groupWriter = writer.CreateRowGroup();
+
+            var keyField = _layout.ParquetSchema.DataFields.First(static field => field.Name == ParquetCellColumns.KeyColumn);
+            var lastAccessField = _layout.ParquetSchema.DataFields.First(static field => field.Name == ParquetCellColumns.LastAccessColumn);
+            groupWriter.WriteColumnAsync(new DataColumn(keyField, keys)).GetAwaiter().GetResult();
+            groupWriter.WriteColumnAsync(new DataColumn(lastAccessField, lastAccess)).GetAwaiter().GetResult();
+
+            for (var slot = 0; slot < _layout.ScalarSlotCount; slot++)
+            {
+                groupWriter.WriteColumnAsync(new DataColumn(_layout.ScalarFields[slot], scalarColumns[slot])).GetAwaiter().GetResult();
+            }
+
+            foreach (var metricIndex in _layout.SketchMetricIndices)
+            {
+                groupWriter.WriteColumnAsync(new DataColumn(_layout.SketchFields[metricIndex], sketchColumns[metricIndex])).GetAwaiter().GetResult();
+            }
         }
 
-        foreach (var metricIndex in _layout.SketchMetricIndices)
-        {
-            groupWriter.WriteColumnAsync(new DataColumn(_layout.SketchFields[metricIndex], sketchColumns[metricIndex])).GetAwaiter().GetResult();
-        }
+        ParquetFileIO.Publish(tempPath, _filePath);
     }
 
     private sealed class HotEntry(CellAggregateState state, long lastAccessTicks, IClock clock)
